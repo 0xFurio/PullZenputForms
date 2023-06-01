@@ -1,0 +1,286 @@
+Parameters:
+  SendgridKey:
+    Type: 'String'
+    Description: 'Enter Sendgrid API Key'
+  ZenputKey:
+    Type: 'String'
+    Description: 'Enter Zenput API Key'
+  Forms:
+    Type: 'String'
+    Description: 'Enter Desired Form IDs (max 4), Separated by Commas in List Form: ["id1","id2","id3"]'
+  BucketName:
+    Type: 'String'
+    Description: 'Enter Bucket Name of S3 Containing Lambda + Layer Files'
+  Sender:
+    Type: 'String'
+    Description: 'Enter Email Sender Address to Use'
+  AlertRecipient:
+    Type: 'String'
+    Description: 'Enter Email Address to Receive Alert Messages'
+Resources:
+  GetFormSubmissionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+  GetFormSubmission:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: 
+      - 'GetFormSubmissionRole'
+      - 'ZenputSubmissions'
+      - 'ProcessedForms'
+    Properties:
+      Runtime: 'python3.7'
+      Role: !GetAtt GetFormSubmissionRole.Arn
+      Handler: 'index.lambda_handler'
+      Timeout: '30'
+      Environment:
+        Variables:
+          SENDGRID_API_KEY: !Ref SendgridKey
+          ZENPUT_API_KEY: !Ref ZenputKey
+          SNS_ARN: !Ref ZenputSubmissions
+          DynamoTable: !Select [1, !Split ['/', !GetAtt ProcessedForms.Arn]]
+      Code:
+        ZipFile: 
+          !Sub |
+            import os
+            import requests
+            import json
+            import boto3 # I HATE BOTO3
+
+            ZENPUT_API_KEY = os.environ['ZENPUT_API_KEY'] # import Zenput API key from environment variables
+            SENDGRID_API_KEY = os.environ['SENDGRID_API_KEY'] # import Sendgrid API key from environment variables
+            PROCESSEDFORMS = os.environ['DynamoTable'] # import DynamoDB table name from environment variables
+            TOPICARN = os.environ['SNS_ARN'] # import SNS Topic ARN from environment variables
+
+
+
+            def lambda_handler(event, context):
+                def get_forms(form): # takes form id as parameter, returns a list of most recent submission ids for that form
+                    form_id = form
+                    base_url = 'https://www.zenput.com/api/v3/submissions' # always use this endpoint
+                    parameters = '?form_template_id=' + form_id
+                    limit = 10 # how many forms to pull, can be changed but seems to work best as 10
+                    request_url = base_url + parameters + '&start=0&limit=' + str(limit) # start should be 0, starts with most recent form and returns 0 + limit forms total
+
+                    headers = {
+                    "accept": "application/json",
+                    "X-API-TOKEN": ZENPUT_API_KEY
+                    }
+                
+                    response = requests.get(request_url, headers=headers).json()
+                    submissions = []
+
+                    count = 0
+                    while count < limit:
+                        submission =  response['data'][count]['legacy_submission_id'] # data corresponds with a dictionary nested in a list... AND WHY IS IT LEGACY????
+                        submissions.append(submission)
+                        count += 1
+                    return submissions
+
+                def send_notification(submission):
+                    sns = boto3.client('sns')
+                    response = sns.publish(TopicArn=TOPICARN, Message=submission)
+                    return response
+
+                def sns_output(submissions):
+                    for submission in submissions:
+                        send_notification(submission)
+
+                def query_dynamodb(form):
+                    dynamodb = boto3.client('dynamodb')
+                    try:
+                        response = dynamodb.get_item(TableName=PROCESSEDFORMS, Key={'FormID': {'S':form}}) # boto3 documentation sucks but FormID is PK of table
+                        if response['Item']['FormID']['S'] == form: # this will error out if the item is not in dynamoDB, triggering the except
+                            return True # true = form is in table
+                    except:
+                        response = dynamodb.put_item(TableName=PROCESSEDFORMS, Item={'FormID': {'S':form}}) # make sure Item set here matches Key above ^^
+                        return False # false = form not in table
+                
+                def dedup_forms(submissions):
+                    new = [] # list of forms that have not been processed
+                    for submission in submissions:
+                        result = query_dynamodb(submission)
+                        if result == True:
+                            pass # form in table, don't send
+                        else:
+                            new.append(submission) #
+                    return new
+                
+                def main():
+                    forms = ${Forms} #list of forms to pull
+                    for form in forms:
+                        submissions = get_forms(form)
+                        new_forms = dedup_forms(submissions)
+                        sns_output(new_forms)
+
+                main()
+  GetFormSubmissionPolicy:
+    Type: 'AWS::IAM::Policy'
+    DependsOn: 'GetFormSubmissionRole'
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action:
+              - 'dynamodb:ListTables'
+              - 'dynamodb:PutItem'
+              - 'dynamodb:GetItem'
+              - 'sns:Publish'
+            Resource: '*'
+      PolicyName: 'GetFormSubmissionPolicy'
+      Roles:
+        - !Ref GetFormSubmissionRole
+  SubmissionParseRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+  SubmissionParseLayer:
+    Type: 'AWS::Lambda::LayerVersion'
+    Properties:
+      CompatibleArchitectures: 
+        - 'x86_64'
+      CompatibleRuntimes: 
+        - 'ruby2.7'
+      Content:
+        S3Bucket: !Ref BucketName
+        S3Key: 'layer.zip'
+      LayerName: 'SubmissionParseLayer'
+  SubmissionParse:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: 
+      - 'SubmissionParseRole'
+      - 'SubmissionParseLayer'
+    Properties:
+      Runtime: 'ruby2.7'
+      Role: !GetAtt SubmissionParseRole.Arn
+      Handler: 'SubmissionParse/lambda.handler'
+      Layers: 
+        - !Ref SubmissionParseLayer
+      Timeout: '30'
+      Environment:
+        Variables:
+          SENDGRID_API_KEY: !Ref SendgridKey
+          ZENPUT_API_KEY: !Ref ZenputKey
+          OPTIONS: 'email'
+          SENDER_ADDRESS: !Ref Sender
+          ALERT_RECIPIENT: !Ref AlertRecipient
+      Code:
+        S3Bucket: !Ref BucketName
+        S3Key: 'SubmissionParse.zip'
+  SubmissionParsePolicy:
+    Type: 'AWS::IAM::Policy'
+    DependsOn: 'SubmissionParseRole'
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Action:
+              - 'sqs:DeleteMessage'
+              - 'sqs:ReceiveMessage'
+              - 'sqs:GetQueueAttributes'
+            Resource: '*'
+      PolicyName: 'SubmissionParsePolicy'
+      Roles:
+        - !Ref SubmissionParseRole
+  ZenputSubmissions:
+    Type: 'AWS::SNS::Topic'
+  ProcessedForms:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      AttributeDefinitions:
+        - 
+          AttributeName: 'FormID'
+          AttributeType: 'S'
+      KeySchema:
+        - 
+          AttributeName: 'FormID'
+          KeyType: 'HASH'
+      ProvisionedThroughput:
+        ReadCapacityUnits: 
+          '1'
+        WriteCapacityUnits: 
+          '1'
+  ZenputSubmissionsDLQ:
+    Type: 'AWS::SQS::Queue'
+  ZenputSubmissionsQueue:
+    Type: 'AWS::SQS::Queue'
+    DependsOn: 'ZenputSubmissionsDLQ'
+    Properties:
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ZenputSubmissionsDLQ.Arn
+        maxReceiveCount: '2'
+  ZenputSubmissionsSubscription:
+    Type: 'AWS::SNS::Subscription'
+    DependsOn: 
+      - 'ZenputSubmissions'
+      - 'ZenputSubmissionsQueue'
+    Properties:
+      TopicArn: !Ref ZenputSubmissions
+      Endpoint: !GetAtt ZenputSubmissionsQueue.Arn
+      Protocol: 'sqs'
+      RawMessageDelivery: 'true'
+  QueuePolicy:
+    Type: 'AWS::SQS::QueuePolicy'
+    DependsOn: 'ZenputSubmissionsQueue'
+    Properties:
+      Queues:
+        - !Ref ZenputSubmissionsQueue
+      PolicyDocument:
+        Statement:
+          - 
+            Action: 'SQS:SendMessage'
+            Effect: 'Allow'
+            Resource: !GetAtt ZenputSubmissionsQueue.Arn
+            Principal:
+              Service: 'sns.amazonaws.com'
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref ZenputSubmissions
+  LambdaMapping:
+    Type: 'AWS::Lambda::EventSourceMapping'
+    DependsOn:
+      - 'SubmissionParse'
+      - 'ZenputSubmissionsQueue'
+      - 'ScheduledEvent'
+      - 'LambdaEventPermissions'
+    Properties:
+      Enabled: 'True'
+      EventSourceArn: !GetAtt ZenputSubmissionsQueue.Arn
+      FunctionName: !Ref SubmissionParse
+  ScheduledEvent:
+    Type: 'AWS::Events::Rule'
+    DependsOn: 'GetFormSubmission'
+    Properties:
+      ScheduleExpression: 'rate(5 minutes)'
+      State: 'ENABLED'
+      Targets:
+        - Arn: !GetAtt GetFormSubmission.Arn
+          Id: '1'
+  LambdaEventPermissions:
+    Type: 'AWS::Lambda::Permission'
+    DependsOn:
+      - 'ScheduledEvent'
+      - 'GetFormSubmission'
+    Properties: 
+        FunctionName: !Ref GetFormSubmission
+        Action: 'lambda:InvokeFunction'
+        Principal: 'events.amazonaws.com'
+        SourceArn: !GetAtt ScheduledEvent.Arn

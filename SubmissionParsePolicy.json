@@ -1,0 +1,17 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                      "sqs:DeleteMessage",
+                      "sqs:ReceiveMessage",
+                      "sqs:GetQueueAttributes",
+                      "logs:CreateLogGroup",
+                      "logs:CreateLogStream",
+                      "logs:PutLogEvents"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

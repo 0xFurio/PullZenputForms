@@ -1,0 +1,18 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                      "dynamodb:ListTables",
+                      "dynamodb:PutItem",
+                      "dynamodb:GetItem",
+                      "logs:CreateLogStream",
+                      "logs:PutLogEvents",
+                      "logs:CreateLogGroup",
+                      "sns:Publish"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

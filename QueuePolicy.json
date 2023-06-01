@@ -1,0 +1,20 @@
+{
+  "Version": "2012-10-17",
+  "Id": "QueuePolicy",
+  "Statement": [
+    {
+      "Sid": "SNS-Send-Message",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "sns.amazonaws.com"
+      },
+      "Action": "sqs:SendMessage",
+      "Resource": "QUEUE-ARN",
+      "Condition": {
+        "ArnEquals": {
+          "aws:SourceArn": "TOPIC-ARN"
+        }
+      }
+    }
+  ]
+}
